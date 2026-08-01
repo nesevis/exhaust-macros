@@ -1,0 +1,693 @@
+import Foundation
+import SwiftDiagnostics
+import SwiftSyntax
+import SwiftSyntaxBuilder
+import SwiftSyntaxMacros
+
+/// Expression macro that expands `#exhaust(gen, .settings...) { ... }` into a call to ``__ExhaustRuntime/__exhaust(...)`` or ``__ExhaustRuntime/__exhaustExpect(...)``.
+///
+/// The macro inspects the trailing closure to determine the runtime function:
+/// - **Multi-statement closures** expand to `__exhaustExpect` (Void-returning, uses `withExpectedIssue`).
+/// - **Single-expression closures containing `#expect` or `#require`** expand to `__exhaustExpect`.
+/// - **All other single-expression closures** expand to `__exhaust` (Bool-returning predicate).
+///
+/// When a function reference is passed via `property:`, the expansion always uses `__exhaust`.
+public struct ExhaustTestMacro: ExpressionMacro {
+    public static func expansion(
+        of node: some FreestandingMacroExpansionSyntax,
+        in context: some MacroExpansionContext
+    ) throws -> ExprSyntax {
+        let args = node.arguments.map(\.self)
+
+        if let trailingClosure = node.trailingClosure {
+            let isVoid = closureIsVoidReturning(trailingClosure)
+            if isVoid, voidClosureLacksFailureMechanism(trailingClosure) {
+                let diagnostic: ExhaustMacroDiagnostic = enclosingFunctionHasTestAttribute(context)
+                    ? .closureCannotFail
+                    : .closureCannotFailXCTest
+                context.diagnose(Diagnostic(
+                    node: Syntax(trailingClosure),
+                    message: diagnostic
+                ))
+            }
+            for site in xcTestCallSites(trailingClosure) {
+                let diagnostic: ExhaustMacroDiagnostic = switch site.kind {
+                    case .unwrap: .xcTestUnwrapInPropertyClosure
+                    case .assert: .xcTestAssertInPropertyClosure
+                }
+                context.diagnose(Diagnostic(node: site.node, message: diagnostic))
+            }
+            let runtimeFunction = switch (
+                closureRequiresTypeDirectedResultDispatch(trailingClosure),
+                isVoid
+            ) {
+                case (true, _): "__exhaustDispatched"
+                case (false, true): "__exhaustExpect"
+                case (false, false): "__exhaust"
+            }
+            return try expandExhaust(
+                of: node,
+                args: args,
+                trailingClosure: trailingClosure,
+                in: context,
+                runtimeFunction: runtimeFunction
+            )
+        } else {
+            return try expandExhaustFunctionReference(
+                of: node,
+                args: args,
+                in: context
+            )
+        }
+    }
+}
+
+// MARK: - Closure Analysis Helpers
+
+/// Determines whether a trailing closure should use the Void assertion path.
+///
+/// Returns `true` (Void path) when the closure body cannot be a Bool-returning predicate:
+/// - Multi-statement closures with no `return <value>`.
+/// - Single `switch`/`if` expressions whose branches contain failure mechanisms (`#expect`, `throw`, `try`, `Issue.record`).
+/// - Single statements that are statement-only constructs (`guard`, `for`, `while`, `repeat`, `do`, `throw`).
+/// - Single statements that are `#expect` or `#require` macro invocations.
+/// - Single statements that are `Issue.record(...)` calls.
+///
+/// Returns `false` (Bool path) when the closure looks like a predicate:
+/// - Single-expression closures (implicit return of a value).
+/// - Single `switch`/`if` expressions with no failure mechanisms (expression switch/if, implicitly returned).
+/// - Multi-statement closures containing `return <value>`.
+func closureIsVoidReturning(_ closure: ClosureExprSyntax) -> Bool {
+    let statements = closure.statements
+
+    if statements.count > 1 {
+        return containsReturnWithValue(statements) == false
+    }
+
+    guard let onlyStatement = statements.first else { return true }
+
+    let item = onlyStatement.item
+
+    // Switch and if are expressions in Swift 5.9+. In a single-statement closure
+    // they are implicitly returned unless the branches contain assertion or throwing
+    // constructs, which mark the closure as imperative (void path).
+    if item.is(SwitchExprSyntax.self) || item.is(IfExprSyntax.self)
+        || item.as(ExpressionStmtSyntax.self).map({ $0.expression.is(SwitchExprSyntax.self) || $0.expression.is(IfExprSyntax.self) }) ?? false
+    {
+        if containsReturnWithValueRecursive(Syntax(item)) {
+            return false
+        }
+        if containsFailureMechanismRecursive(Syntax(item)) {
+            return true
+        }
+        return false
+    }
+
+    // Pure statements (guard, for, while, repeat, do, throw) are always void.
+    if isStatementOnlyConstruct(Syntax(item)) {
+        return containsReturnWithValueRecursive(Syntax(item)) == false
+    }
+
+    // #expect(...) or #require(...)
+    if let macroExpr = item.as(MacroExpansionExprSyntax.self) {
+        let name = macroExpr.macroName.text
+        if name == "expect" || name == "require" {
+            return true
+        }
+    }
+
+    // try #require(...)
+    if let tryExpr = item.as(TryExprSyntax.self),
+       let macroExpr = tryExpr.expression.as(MacroExpansionExprSyntax.self)
+    {
+        let name = macroExpr.macroName.text
+        if name == "expect" || name == "require" {
+            return true
+        }
+    }
+
+    // Issue.record(...)
+    if let call = item.as(FunctionCallExprSyntax.self), isIssueRecordCall(call) {
+        return true
+    }
+
+    // XCTAssert*, XCTFail, XCTUnwrap — all return Void (XCTUnwrap returns T, but
+    // it's not Bool, so the Bool path would produce a type error regardless).
+    if let call = item.as(FunctionCallExprSyntax.self),
+       let ref = call.calledExpression.as(DeclReferenceExprSyntax.self),
+       ref.baseName.text.hasPrefix("XCTAssert") || ref.baseName.text == "XCTFail" || ref.baseName.text == "XCTUnwrap"
+    {
+        return true
+    }
+
+    // Declarations (let, var, func, etc.) never produce a value.
+    if item.as(DeclSyntax.self) != nil {
+        return true
+    }
+
+    // Single expression that returns a value — Bool path.
+    return false
+}
+
+/// Returns whether Swift's type checker must distinguish a throwing `Bool` helper from a throwing `Void` helper.
+private func closureRequiresTypeDirectedResultDispatch(_ closure: ClosureExprSyntax) -> Bool {
+    guard closure.statements.count == 1,
+          let onlyStatement = closure.statements.first
+    else {
+        return false
+    }
+
+    if onlyStatement.item.is(TryExprSyntax.self) {
+        return true
+    }
+
+    return onlyStatement.item.as(ExpressionStmtSyntax.self)?.expression.is(TryExprSyntax.self)
+        ?? false
+}
+
+/// Checks whether a syntax node is a statement-only construct that never produces a value (guard, for, while, repeat, do, throw).
+private func isStatementOnlyConstruct(_ node: Syntax) -> Bool {
+    node.is(GuardStmtSyntax.self)
+        || node.is(ForStmtSyntax.self)
+        || node.is(WhileStmtSyntax.self)
+        || node.is(RepeatStmtSyntax.self)
+        || node.is(DoStmtSyntax.self)
+        || node.is(ThrowStmtSyntax.self)
+        || node.as(ExpressionStmtSyntax.self).map { isStatementOnlyConstruct(Syntax($0.expression)) } ?? false
+}
+
+/// Checks whether any statement in the closure body is a `return` with an expression value.
+private func containsReturnWithValue(_ statements: CodeBlockItemListSyntax) -> Bool {
+    for statement in statements {
+        // Direct return statement
+        if let returnStmt = statement.item.as(ReturnStmtSyntax.self),
+           returnStmt.expression != nil
+        {
+            return true
+        }
+
+        // Return inside if/else, guard, switch, for, while, do/catch
+        if containsReturnWithValueRecursive(Syntax(statement.item)) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Recursively walks a syntax node looking for `return <value>` statements.
+private func containsReturnWithValueRecursive(_ node: Syntax) -> Bool {
+    for child in node.children(viewMode: .sourceAccurate) {
+        if let returnStmt = child.as(ReturnStmtSyntax.self),
+           returnStmt.expression != nil
+        {
+            return true
+        }
+        // Don't recurse into nested closures — their returns are their own
+        if child.is(ClosureExprSyntax.self) {
+            continue
+        }
+        if containsReturnWithValueRecursive(child) {
+            return true
+        }
+    }
+    return false
+}
+
+// MARK: - Issue.record Detection
+
+/// Returns `true` when the call expression is `Issue.record(...)` or `Testing.Issue.record(...)`.
+private func isIssueRecordCall(_ node: FunctionCallExprSyntax) -> Bool {
+    guard let memberAccess = node.calledExpression.as(MemberAccessExprSyntax.self),
+          memberAccess.declName.baseName.text == "record"
+    else { return false }
+
+    if let base = memberAccess.base?.as(DeclReferenceExprSyntax.self),
+       base.baseName.text == "Issue"
+    {
+        return true
+    }
+
+    if let base = memberAccess.base?.as(MemberAccessExprSyntax.self),
+       base.declName.baseName.text == "Issue",
+       let outerBase = base.base?.as(DeclReferenceExprSyntax.self),
+       outerBase.baseName.text == "Testing"
+    {
+        return true
+    }
+
+    return false
+}
+
+// MARK: - Vacuous Closure Detection
+
+/// Returns `true` when a void-path closure has no mechanism to signal failure.
+///
+/// A void-path closure can signal failure via `throw`/`try`, `#expect`/`#require`,
+/// or `Issue.record`. If none of these appear (outside nested closures), the
+/// closure always passes — every run is vacuously successful. This includes
+/// single-statement control flow (for example, a switch expression whose
+/// branch values are silently discarded).
+func voidClosureLacksFailureMechanism(_ closure: ClosureExprSyntax) -> Bool {
+    containsFailureMechanism(closure.statements) == false
+}
+
+/// Recursively walks statements looking for any construct that can signal test failure.
+private func containsFailureMechanism(_ statements: CodeBlockItemListSyntax) -> Bool {
+    statements.contains(where: {
+        containsFailureMechanismRecursive(Syntax($0.item))
+    })
+}
+
+private func containsFailureMechanismRecursive(_ node: Syntax) -> Bool {
+    // Plain `try` (not `try?` or `try!`) propagates thrown errors as failures.
+    if let tryExpr = node.as(TryExprSyntax.self),
+       tryExpr.questionOrExclamationMark == nil
+    {
+        return true
+    }
+
+    if node.is(ThrowStmtSyntax.self) {
+        return true
+    }
+
+    // #expect(...) or #require(...)
+    if let macroExpr = node.as(MacroExpansionExprSyntax.self) {
+        let name = macroExpr.macroName.text
+        if name == "expect" || name == "require" {
+            return true
+        }
+    }
+
+    // Issue.record(...)
+    if let call = node.as(FunctionCallExprSyntax.self), isIssueRecordCall(call) {
+        return true
+    }
+
+    for child in node.children(viewMode: .sourceAccurate) {
+        if child.is(ClosureExprSyntax.self) {
+            continue
+        }
+        if containsFailureMechanismRecursive(child) {
+            return true
+        }
+    }
+    return false
+}
+
+// MARK: - XCTest API Detection
+
+enum XCTestCallKind {
+    case unwrap
+    case assert
+}
+
+struct XCTestCallSite {
+    let node: Syntax
+    let kind: XCTestCallKind
+}
+
+/// Returns call sites of `XCTUnwrap` and `XCTAssert*`/`XCTFail` in the closure body (not in nested closures).
+func xcTestCallSites(_ closure: ClosureExprSyntax) -> [XCTestCallSite] {
+    var sites: [XCTestCallSite] = []
+    collectXCTestCalls(Syntax(closure.statements), depth: 0, into: &sites)
+    return sites
+}
+
+private func collectXCTestCalls(_ node: Syntax, depth: Int, into sites: inout [XCTestCallSite]) {
+    if node.is(ClosureExprSyntax.self), depth > 0 {
+        return
+    }
+    if let call = node.as(FunctionCallExprSyntax.self),
+       let ref = call.calledExpression.as(DeclReferenceExprSyntax.self)
+    {
+        let name = ref.baseName.text
+        if name == "XCTUnwrap" {
+            sites.append(XCTestCallSite(node: Syntax(call), kind: .unwrap))
+        } else if name.hasPrefix("XCTAssert") || name == "XCTFail" {
+            sites.append(XCTestCallSite(node: Syntax(call), kind: .assert))
+        }
+    }
+    let nextDepth = node.is(ClosureExprSyntax.self) ? depth + 1 : depth
+    for child in node.children(viewMode: .sourceAccurate) {
+        collectXCTestCalls(child, depth: nextDepth, into: &sites)
+    }
+}
+
+// MARK: - Test Framework Detection
+
+/// Returns `true` when the enclosing function has a `@Test` attribute, indicating Swift Testing context.
+func enclosingFunctionHasTestAttribute(_ context: some MacroExpansionContext) -> Bool {
+    for enclosing in context.lexicalContext {
+        if let funcDecl = enclosing.as(FunctionDeclSyntax.self) {
+            for attribute in funcDecl.attributes {
+                if let attr = attribute.as(AttributeSyntax.self),
+                   let identifier = attr.attributeName.as(IdentifierTypeSyntax.self),
+                   identifier.name.text == "Test"
+                {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+// MARK: - Detection Closure Rewriting
+
+/// Rewrites `#expect`, `#require`, and `Issue.record` calls in a closure body to use `__ExhaustRuntime.__detectRequire`.
+///
+/// This replaces Swift Testing assertion macros and `Issue.record` calls with plain throwing function calls that don't call `Issue.record()`, producing no test output during reduction. Boolean checks, optional unwraps, and unconditional issue recording are handled:
+///
+/// - `#expect(condition)` → `try __ExhaustRuntime.__detectRequire(condition)`
+/// - `try #require(condition)` → `try __ExhaustRuntime.__detectRequire(condition)`
+/// - `let x = try #require(optional)` → `let x = try __ExhaustRuntime.__detectRequire(optional)`
+/// - `Issue.record(...)` → `try __ExhaustRuntime.__detectRequire(false)`
+///
+/// Does not recurse into nested closures.
+func rewriteExpectToRequire(_ closure: ClosureExprSyntax) -> ClosureExprSyntax {
+    let rewriter = DetectionRewriter(viewMode: .sourceAccurate)
+    return rewriter.rewrite(closure).cast(ClosureExprSyntax.self)
+}
+
+/// Rewrites `#expect`/`#require` calls in the property closure to include explicit `sourceLocation:` parameters.
+///
+/// In a macro expansion, `#_sourceLocation` resolves to the expansion site (the `#exhaust` line), not the original assertion line. This rewriter uses `MacroExpansionContext.location(of:)` to get each assertion's original source location and injects it as an explicit argument.
+final class SourceLocationRewriter: SyntaxRewriter {
+    let context: any MacroExpansionContext
+    private var closureDepth = 0
+
+    init(context: some MacroExpansionContext, viewMode: SyntaxTreeViewMode) {
+        self.context = context
+        super.init(viewMode: viewMode)
+    }
+
+    override func visit(_ node: ClosureExprSyntax) -> ExprSyntax {
+        closureDepth += 1
+        defer { closureDepth -= 1 }
+        if closureDepth > 1 { return ExprSyntax(node) }
+        return super.visit(node)
+    }
+
+    override func visit(_ node: MacroExpansionExprSyntax) -> ExprSyntax {
+        guard node.macroName.text == "expect" || node.macroName.text == "require" else {
+            return super.visit(node)
+        }
+        // Check if sourceLocation: is already specified
+        let hasSourceLocation = node.arguments.contains { $0.label?.text == "sourceLocation" }
+        if hasSourceLocation { return ExprSyntax(node) }
+
+        guard let location = context.location(of: node, at: .afterLeadingTrivia, filePathMode: .filePath) else {
+            // If location is unavailable, pass through unchanged.
+            return ExprSyntax(node)
+        }
+        guard let fileIDLocation = context.location(of: node, at: .afterLeadingTrivia, filePathMode: .fileID) else {
+            return ExprSyntax(node)
+        }
+
+        // Add sourceLocation: parameter with the original source location
+        var arguments = node.arguments
+        // Add trailing comma to the last existing argument
+        if var lastArg = arguments.last {
+            lastArg.trailingComma = .commaToken(trailingTrivia: .space)
+            arguments = LabeledExprListSyntax(arguments.dropLast() + [lastArg])
+        }
+        let sourceLocationArg = LabeledExprSyntax(
+            label: .identifier("sourceLocation"),
+            colon: .colonToken(trailingTrivia: .space),
+            expression: ExprSyntax(
+                "Testing.SourceLocation(fileID: \(fileIDLocation.file), filePath: \(location.file), line: \(location.line), column: \(location.column))" as ExprSyntax
+            )
+        )
+        arguments += [sourceLocationArg]
+
+        return ExprSyntax(node.with(\.arguments, arguments))
+    }
+}
+
+/// Replaces `#expect`, `#require`, and `Issue.record` calls with `__ExhaustRuntime.__detectRequire` calls.
+/// Skips nested closures (depth > 0) since their assertions are their own.
+private final class DetectionRewriter: SyntaxRewriter {
+    private var closureDepth = 0
+
+    override func visit(_ node: ClosureExprSyntax) -> ExprSyntax {
+        closureDepth += 1
+        defer { closureDepth -= 1 }
+        if closureDepth > 1 {
+            // Nested closure — don't rewrite its assertions.
+            return ExprSyntax(node)
+        }
+        return super.visit(node)
+    }
+
+    override func visit(_ node: FunctionCallExprSyntax) -> ExprSyntax {
+        guard isIssueRecordCall(node) else {
+            return super.visit(node)
+        }
+        let call = FunctionCallExprSyntax(
+            leadingTrivia: node.leadingTrivia,
+            calledExpression: MemberAccessExprSyntax(
+                base: DeclReferenceExprSyntax(baseName: .identifier("__ExhaustRuntime")),
+                period: .periodToken(),
+                name: .identifier("__detectRequire")
+            ),
+            leftParen: .leftParenToken(),
+            arguments: LabeledExprListSyntax([
+                LabeledExprSyntax(expression: ExprSyntax(BooleanLiteralExprSyntax(literal: .keyword(.false)))),
+            ]),
+            rightParen: .rightParenToken()
+        )
+        return ExprSyntax(TryExprSyntax(
+            tryKeyword: .keyword(.try, leadingTrivia: node.leadingTrivia, trailingTrivia: .space),
+            expression: ExprSyntax(call.with(\.leadingTrivia, []))
+        ))
+    }
+
+    override func visit(_ node: MacroExpansionExprSyntax) -> ExprSyntax {
+        guard node.macroName.text == "expect" || node.macroName.text == "require" else {
+            return super.visit(node)
+        }
+        guard let firstArg = node.arguments.first else {
+            return ExprSyntax(node)
+        }
+        // Replace #expect/#require(args...) with __ExhaustRuntime.__detectRequire(firstArg)
+        let call = FunctionCallExprSyntax(
+            leadingTrivia: node.pound.leadingTrivia,
+            calledExpression: MemberAccessExprSyntax(
+                base: DeclReferenceExprSyntax(baseName: .identifier("__ExhaustRuntime")),
+                period: .periodToken(),
+                name: .identifier("__detectRequire")
+            ),
+            leftParen: .leftParenToken(),
+            arguments: LabeledExprListSyntax([
+                LabeledExprSyntax(expression: firstArg.expression.trimmed),
+            ]),
+            rightParen: .rightParenToken()
+        )
+        // If the original was #expect (not already inside a try), wrap in try.
+        // If it was #require, it's already inside a TryExprSyntax — the parent handles try.
+        if node.macroName.text == "expect" {
+            return ExprSyntax(TryExprSyntax(
+                tryKeyword: .keyword(.try, leadingTrivia: node.pound.leadingTrivia, trailingTrivia: .space),
+                expression: ExprSyntax(call.with(\.leadingTrivia, []))
+            ))
+        }
+        return ExprSyntax(call)
+    }
+}
+
+// MARK: - Shared Expansion Logic
+
+/// Expands the trailing-closure form of `#exhaust`.
+private func expandExhaust(
+    of node: some FreestandingMacroExpansionSyntax,
+    args: [LabeledExprListSyntax.Element],
+    trailingClosure: ClosureExprSyntax,
+    in context: some MacroExpansionContext,
+    runtimeFunction: String
+) throws -> ExprSyntax {
+    guard !args.isEmpty else {
+        context.diagnose(Diagnostic(
+            node: Syntax(node),
+            message: ExhaustMacroDiagnostic.exhaustMissingGenerator
+        ))
+        return "fatalError(\"#exhaust requires a generator argument\")"
+    }
+
+    let generatorExpr = args[0].expression.trimmedDescription
+
+    var reflectingExpr: String?
+    var settingsExprs: [String] = []
+    for arg in args.dropFirst() {
+        if arg.label?.text == "reflecting" {
+            reflectingExpr = arg.expression.trimmedDescription
+        } else {
+            settingsExprs.append(arg.expression.trimmedDescription)
+        }
+    }
+
+    let settingsArray = settingsExprs.isEmpty ? "[]" : "[\(settingsExprs.joined(separator: ", "))]"
+    let reflectingLine = reflectingExpr.map { "reflecting: \($0)," } ?? ""
+
+    if runtimeFunction == "__exhaustExpect" || runtimeFunction == "__exhaustExpectAsync" {
+        // Void path: pass both the original closure (for final re-run with #expect)
+        // and a detection closure (with #expect → __detectRequire, for pipeline via try/catch).
+        //
+        // Rewrite property closure to inject explicit sourceLocation: on each #expect/#require.
+        // Without this, #_sourceLocation resolves to the #exhaust expansion site.
+        let sourceLocationRewriter = SourceLocationRewriter(context: context, viewMode: .sourceAccurate)
+        let propertyWithLocations = sourceLocationRewriter.rewrite(trailingClosure).cast(ClosureExprSyntax.self)
+
+        // Detection closure: #expect/#require → __detectRequire (silent, no Issue.record).
+        // Strip `async` — the detection closure is always synchronous.
+        var detectionClosure = rewriteExpectToRequire(trailingClosure)
+        if let sig = detectionClosure.signature,
+           let effects = sig.effectSpecifiers,
+           effects.asyncSpecifier != nil
+        {
+            let strippedEffects = effects.with(\.asyncSpecifier, nil)
+            detectionClosure = detectionClosure.with(\.signature, sig.with(\.effectSpecifiers, strippedEffects))
+        }
+        let detectionText = detectionClosure.description
+
+        return """
+        __ExhaustRuntime.\(raw: runtimeFunction)(
+            \(raw: generatorExpr),
+            settings: \(raw: settingsArray),
+            \(raw: reflectingLine)
+
+            fileID: #fileID,
+            filePath: #filePath,
+            line: #line,
+            column: #column,
+            function: #function,
+            property: \(propertyWithLocations),
+            detection: \(raw: detectionText)
+        )
+        """
+    }
+
+    return """
+    __ExhaustRuntime.\(raw: runtimeFunction)(
+        \(raw: generatorExpr),
+        settings: \(raw: settingsArray),
+        \(raw: reflectingLine)
+        fileID: #fileID,
+        filePath: #filePath,
+        line: #line,
+        column: #column,
+        function: #function,
+        property: \(trailingClosure)
+    )
+    """
+}
+
+/// Expands the function-reference form of `#exhaust(gen, property: someFunc)`.
+private func expandExhaustFunctionReference(
+    of node: some FreestandingMacroExpansionSyntax,
+    args: [LabeledExprListSyntax.Element],
+    in context: some MacroExpansionContext,
+    runtimeFunction: String = "__exhaust"
+) throws -> ExprSyntax {
+    guard args.count >= 2 else {
+        context.diagnose(Diagnostic(
+            node: Syntax(node),
+            message: ExhaustMacroDiagnostic.exhaustMissingProperty
+        ))
+        return "fatalError(\"#exhaust requires a property argument\")"
+    }
+
+    let generatorExpr = args[0].expression.trimmedDescription
+
+    guard let propertyArg = args.last, propertyArg.label?.text == "property" else {
+        context.diagnose(Diagnostic(
+            node: Syntax(node),
+            message: ExhaustMacroDiagnostic.exhaustMissingProperty
+        ))
+        return "fatalError(\"#exhaust requires a property argument\")"
+    }
+
+    let propertyExpr = propertyArg.expression.trimmedDescription
+
+    var reflectingExpr: String?
+    var settingsExprs: [String] = []
+    for arg in args.dropFirst().dropLast() {
+        if arg.label?.text == "reflecting" {
+            reflectingExpr = arg.expression.trimmedDescription
+        } else {
+            settingsExprs.append(arg.expression.trimmedDescription)
+        }
+    }
+    let settingsArray = settingsExprs.isEmpty ? "[]" : "[\(settingsExprs.joined(separator: ", "))]"
+    let reflectingLine = reflectingExpr.map { "reflecting: \($0)," } ?? ""
+
+    return """
+    __ExhaustRuntime.\(raw: runtimeFunction)(
+        \(raw: generatorExpr),
+        settings: \(raw: settingsArray),
+        \(raw: reflectingLine)
+
+        fileID: #fileID,
+        filePath: #filePath,
+        line: #line,
+        column: #column,
+        function: #function,
+        property: \(raw: propertyExpr)
+    )
+    """
+}
+
+// MARK: - Async Property Macro
+
+/// Expression macro that expands `#exhaust(gen, .settings...) { value in await ... }` into a call to ``__ExhaustRuntime/__exhaustAsync(...)`` or ``__ExhaustRuntime/__exhaustExpectAsync(...)``.
+///
+/// Identical to ``ExhaustTestMacro`` but emits the async runtime variants. Swift's overload resolution routes here when the trailing closure's type is `(T) async throws -> R`.
+public struct ExhaustAsyncTestMacro: ExpressionMacro {
+    public static func expansion(
+        of node: some FreestandingMacroExpansionSyntax,
+        in context: some MacroExpansionContext
+    ) throws -> ExprSyntax {
+        let args = node.arguments.map(\.self)
+
+        if let trailingClosure = node.trailingClosure {
+            let isVoid = closureIsVoidReturning(trailingClosure)
+            if isVoid, voidClosureLacksFailureMechanism(trailingClosure) {
+                let diagnostic: ExhaustMacroDiagnostic = enclosingFunctionHasTestAttribute(context)
+                    ? .closureCannotFail
+                    : .closureCannotFailXCTest
+                context.diagnose(Diagnostic(
+                    node: Syntax(trailingClosure),
+                    message: diagnostic
+                ))
+            }
+            for site in xcTestCallSites(trailingClosure) {
+                let diagnostic: ExhaustMacroDiagnostic = switch site.kind {
+                    case .unwrap: .xcTestUnwrapInPropertyClosure
+                    case .assert: .xcTestAssertInPropertyClosure
+                }
+                context.diagnose(Diagnostic(node: site.node, message: diagnostic))
+            }
+            let runtimeFunction = switch (
+                closureRequiresTypeDirectedResultDispatch(trailingClosure),
+                isVoid
+            ) {
+                case (true, _): "__exhaustDispatchedAsync"
+                case (false, true): "__exhaustExpectAsync"
+                case (false, false): "__exhaustAsync"
+            }
+            return try expandExhaust(
+                of: node,
+                args: args,
+                trailingClosure: trailingClosure,
+                in: context,
+                runtimeFunction: runtimeFunction
+            )
+        } else {
+            return try expandExhaustFunctionReference(
+                of: node,
+                args: args,
+                in: context,
+                runtimeFunction: "__exhaustAsync"
+            )
+        }
+    }
+}
